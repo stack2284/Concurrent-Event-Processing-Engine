@@ -1,98 +1,171 @@
 # Concurrent Event Processing Engine
 
-A single-process, event-driven transaction processor written in Go. Account-transfer events are ingested, deduplicated, partitioned across worker goroutines, applied to a lock-free ledger with saga-style compensation, retried with jittered exponential backoff, and dead-lettered when attempts are exhausted. A write-ahead log makes the state recoverable after a crash. Every stage is counted and sampled for tracing.
+A high-throughput, in-memory transaction processing engine written in Go. Account-transfer events are validated, deduplicated, partitioned across worker goroutines, executed against an atomic ledger with compensation on failure, and recorded to an append-only write-ahead log (WAL) for crash recovery.
 
-This is not a multi-node system. Workers are goroutines in one process, and the only durable state is the write-ahead log on local disk.
+The engine runs within a single process. Concurrency is handled across worker goroutines using bounded lock-free ring queues, and state durability is backed by local disk storage.
 
-## Layout
+---
 
-```
-cmd/engine           CLI: bench, suite, serve
-internal/dedupe      lock-free open-addressing id set
-internal/ledger      cache-line padded atomic balances
-internal/ring        lock-free bounded MPSC queue with batch dequeue
-internal/wal         write-ahead log with group commit and torn-tail recovery
-internal/engine      ingestion, partitioned queues, workers, DLQ, recovery
-internal/retry       single-goroutine timer heap for backoff
-internal/metrics     sharded counters, log-linear latency histogram
-internal/trace       sampled span recorder
-internal/server      HTTP ingestion and observability endpoints
-internal/bench       workload generator and consistency verifier
-```
+## Directory Structure
 
-## Design
-
-- **Ingestion**: `IngestBatch` validates events, claims their ids in the dedupe set, appends the accepted ones to the log in a single locked section, and enqueues them on the partition owned by the source account. `TryIngest` is the non-blocking variant: when a queue is full it writes a void record and releases the claim.
-- **Duplicate detection**: a fixed-size table of 64-bit keys. Claiming an id is a single CAS, so concurrent duplicates have exactly one winner. Removal uses tombstones so probe chains stay intact.
-- **Partitioning and queues**: events hash by source account onto one queue per worker, so debits for an account are serialized on one goroutine. Queues are bounded lock-free rings (per-slot sequence numbers) that workers drain in batches of 64. Profiling showed Go channels spent most of their time on lock contention. Replacing them roughly doubled throughput.
-- **Transaction consistency**: each transfer is a two-step saga. Debit is a CAS that fails on insufficient funds (terminal reject). If the commit stage fails after the debit, the debit is compensated before the event is retried, so a failed attempt never leaves a partial effect.
-- **Retries**: failed events go to a timer heap with jittered exponential backoff and are re-enqueued on their partition. After `MaxAttempts` they land in the dead-letter queue, which can be replayed.
-- **Durability**: accepted events are appended to the log before they are enqueued. Workers append commit, reject and dead-letter outcomes once per batch. A flusher goroutine group-commits: while one fsync runs, new records accumulate and share the next one. Records carry CRC32C checksums.
-- **Recovery**: on startup the log is replayed up to the first torn or corrupt record, and the tail is truncated. The ledger is derived state: committed transfers are re-applied, rejected and dead-lettered events are restored, and events with no recorded outcome are re-enqueued. Because the ledger is rebuilt only from the log, an event is applied exactly once whether the crash came before or after its in-memory effect.
-- **Sync modes**: `buffered` writes without fsync, `group` fsyncs asynchronously (a crash can lose the most recent unsynced events, never half-apply one), and `ack` makes ingestion wait until the event is on disk before it is enqueued.
-- **Monitoring**: per-worker counters and histograms avoid shared cache lines. Latency is measured from ingest to terminal state with 12.5% bucket resolution.
-- **Tracing**: events are sampled by id hash; queue, debit, credit, commit, retry, reject and dead-letter spans are recorded in a ring and grouped per trace.
-
-## Usage
-
-```
-make test            # unit and integration tests
-make race            # same under the race detector
-make suite           # full evaluation table
-./bin/engine bench -events 2000000 -dup 0.1 -fault 0.02 -wal group
-./bin/engine serve -addr :8080 -wal-path ./engine.wal -wal-mode group
+```text
+cmd/engine/          CLI entrypoints: bench, suite, serve
+internal/
+├── bench/           Synthetic workload generator and ledger verification
+├── dedupe/          Lock-free open-addressing deduplication set
+├── engine/          Core pipeline: ingestion, routing, workers, DLQ, recovery
+├── event/           Event data structures
+├── hash/            SplitMix64 mixing and fast range reduction
+├── ledger/          Cache-line padded atomic account ledger
+├── metrics/         Sharded counters and log-linear latency histogram
+├── retry/           Single-goroutine timer heap for exponential backoff
+├── ring/            Lock-free bounded MPSC queue with batch dequeue
+├── server/          HTTP ingestion and observability handlers
+├── trace/           Trace recorder with configurable sampling
+└── wal/             Write-ahead log with group commit and torn-tail recovery
 ```
 
-HTTP endpoints: `POST /ingest`, `GET /metrics`, `GET /traces`, `GET /deadletters`, `POST /deadletters/replay`, `GET /balance/{account}`, `GET /healthz`. Ingest body: `[{"id":1,"from":0,"to":1,"amount":50}]`. A full queue returns 429.
+---
 
-## Evaluation
+## Architecture & Mechanics
 
-Apple silicon, 14 cores, Go 1.24, 2M unique events and 100k accounts per scenario (200k for `ack`), 4 producers submitting batches of 128. Fault rate is the probability of failure at each of the two stages per attempt, retries are capped at 6 attempts, and dead letters are replayed at the end of each run.
+### Ingestion & Deduplication
+- **Admission**: Ingestion accepts single events or batches. Each event is validated for non-zero amount, distinct source/destination accounts, and valid account bounds.
+- **Deduplication (`internal/dedupe`)**: Fixed-capacity table of 64-bit keys using open addressing with linear probing. ID acquisition is executed via a single `CompareAndSwapUint64`. Duplicate events are dropped immediately. Removals write a tombstone to maintain probe chain integrity.
+- **Backpressure**: In non-blocking mode (`TryIngest`), if target worker queues are full, admitted claims are voided, released from the dedupe table, logged as void in the WAL, and rejected with `429 Too Many Requests`.
 
-Every run verifies: committed plus rejected equals unique events, duplicates dropped equals duplicates sent, the pending count is zero, total ledger supply is conserved, and every account balance equals its initial balance plus the exact net of the unique events. Runs with a log also stop the engine, recover a new one from the log, and check that every balance matches.
+### Partitioning & Worker Queues
+- **Account Affinity**: Events are partitioned by hashing the source account ID (`hash.Mix(from)`). All debits for a given account are serialized onto a single worker goroutine, eliminating cross-worker balance contention on source accounts.
+- **Ring Buffers (`internal/ring`)**: Multi-Producer Single-Consumer (MPSC) bounded ring queues using per-slot sequence numbers (Vyukov queue). Workers drain batches of up to 64 events per iteration, falling back to brief spinning before parking on a wake channel.
 
-| scenario | workers | offered | events/s | p50 | p99 | p99.9 | dups | retries | compensations | dlq | consistent |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| baseline | 14 | 2.0M | 21.2M | 15us | 3.4ms | 4.7ms | 0 | 0 | 0 | 0 | yes |
-| 10% duplicates | 14 | 2.2M | 21.0M | 13us | 82us | 4.2ms | 200k | 0 | 0 | 0 | yes |
-| dup 10%, fault 2% | 14 | 2.2M | 24.3M | 20us | 9.4ms | 10.5ms | 200k | 82k | 41k | 0 | yes |
-| dup 10%, fault 20% | 14 | 2.2M | 2.0M | 9.4ms | 1.0s | 1.1s | 200k | 1.12M | 499k | 4398 | yes |
-| skew 50% on 10 accounts | 14 | 2.2M | 21.5M | 18us | 590us | 1.8ms | 200k | 82k | 41k | 0 | yes |
-| paced 300k/s | 14 | 2.2M | 300k | 25us | 426us | 918us | 200k | 82k | 41k | 0 | yes |
+### Ledger & Consistency
+- **Cache-Line Isolation (`internal/ledger`)**: Account balances are stored as atomic 64-bit integers padded to 64-byte boundaries (`[56]byte` padding) to prevent false sharing under high concurrency.
+- **Two-Step Saga Execution**: 
+  1. Source account is debited via CAS. If balance is insufficient, the transaction terminates with a reject.
+  2. If the secondary stage (credit or downstream commit) fails, the engine issues a compensating credit back to the source account before queuing for retry, ensuring no half-applied state persists.
 
-Allocations per event round to zero in every scenario except the 20% fault run, where retries allocate (0.01 per event).
+### Retries & Dead-Letter Queue
+- **Backoff Scheduler (`internal/retry`)**: Failed events are pushed to an in-memory binary min-heap timer queue. Backoff delays follow exponential scaling with uniform random jitter.
+- **Re-routing**: Expired retry events are re-enqueued onto the appropriate worker partition.
+- **Dead-Lettering**: Events exhausting `MaxAttempts` are moved to an in-memory dead-letter queue (DLQ) and flagged in the WAL. The DLQ can be queried or replayed via HTTP.
 
-Write-ahead log (10% duplicates, 2% faults, 14 workers):
+### Durability & Recovery
+- **Write-Ahead Log (`internal/wal`)**: Append-only log with CRC32C checksums covering header and payload fields.
+- **Sync Modes**:
+  - `buffered`: Writes to OS page cache without explicit flush.
+  - `group`: Background flusher executes asynchronous group commits (`f.Sync()`), coalescing pending writes.
+  - `ack`: Admission blocks until the batch is synchronized to persistent storage via `f.Sync()`.
+- **Crash Recovery**: Startup replays the WAL from offset 0 up to the first corrupt or torn record, truncating trailing incomplete writes. The engine restores deduplication keys, reconstructs ledger balances from committed records, re-populates the DLQ, and re-enqueues accepted transactions that lacked terminal outcome records.
 
-| mode | events/s | p99 | recovery |
-|---|---|---|---|
-| none | 24.3M | 9.4ms | - |
-| buffered | 11.4M | 492us | 400ms for 4.0M records |
-| group commit | 12.4M | 426us | 395ms for 4.0M records |
-| ack (200k events) | 31.7k | 14.7ms | 50ms for 400k records |
+---
 
-In `ack` mode every batch waits for a full fsync (F_FULLFSYNC on macOS), so throughput is bounded by producers divided by fsync latency.
+## Getting Started
 
-Worker scaling (10% duplicates, 2% faults, no log):
+### Prerequisites
+- Go 1.24+
 
-| workers | events/s | speedup |
+### Build & Test
+
+```bash
+# Build CLI binary
+make build
+
+# Run unit and integration tests
+make test
+
+# Run tests under Go race detector
+make race
+```
+
+### Running the Server
+
+```bash
+./bin/engine serve \
+  -addr :8080 \
+  -accounts 10000 \
+  -balance 1000000 \
+  -workers 8 \
+  -queue 4096 \
+  -wal-path ./engine.wal \
+  -wal-mode group
+```
+
+---
+
+## HTTP API
+
+| Method | Path | Description |
 |---|---|---|
-| 1 | 7.18M | 1.0x |
-| 2 | 10.7M | 1.5x |
-| 4 | 16.5M | 2.3x |
-| 8 | 19.8M | 2.8x |
-| 14 | 22.7M | 3.2x |
+| `POST` | `/ingest` | Ingest batch of transfer events (JSON array) |
+| `GET` | `/balance/{account}` | Return balance for account ID |
+| `GET` | `/metrics` | Prometheus-compatible plain-text metrics |
+| `GET` | `/traces` | Retrieve sampled transaction execution traces |
+| `GET` | `/deadletters` | List dead-lettered events |
+| `POST` | `/deadletters/replay` | Replay dead-lettered events back into processing |
+| `GET` | `/healthz` | Health check endpoint |
 
-Notes: at 8+ workers the four producer goroutines and memory bandwidth, not worker capacity, are the limit, and latencies in unbounded runs mostly reflect batching and queue depth. The paced run is the representative latency figure. The 20% fault case shows tail latency from backoff, where retried events wait up to the capped delay.
+### Example Ingestion
 
-## Crash testing
+```bash
+curl -X POST http://localhost:8080/ingest \
+  -H "Content-Type: application/json" \
+  -d '[
+    {"id": 1001, "from": 12, "to": 45, "amount": 250},
+    {"id": 1002, "from": 45, "to": 90, "amount": 100}
+  ]'
+```
 
-`TestCrashMidRunRecoversExactBalances` runs 64 producers against an `ack` log with 5% faults at each stage, aborts the log mid-run (unflushed buffers are discarded and later appends fail), then opens a new engine on the same file. It checks that every acknowledged event was recovered, that re-ingesting everything deduplicates the acknowledged ones, and that final balances equal the exact net of all events applied once. Further tests cover clean restarts, dead letters across restarts, torn tails, corrupt records and void records after backpressure.
+Response:
+```json
+{
+  "accepted": 2,
+  "duplicates": 0,
+  "invalid": 0,
+  "throttled": 0
+}
+```
 
-## Limits
+---
 
-- Single process, single node. Nothing here replicates the log or coordinates between machines.
-- The log grows without bound. There is no snapshotting or compaction, so recovery time grows with the log.
-- In `buffered` and `group` modes, events acknowledged after the last fsync can be lost in a crash. Only `ack` guarantees that an acknowledged event is on disk.
-- The dedupe table has fixed capacity and returns an error when a probe sequence is exhausted. Size it to the number of ids you expect to retain, including those recovered from the log.
-- Event ids must be at most `MaxUint64 - 3`.
+## Benchmarks & Verification
+
+The CLI includes an integrated synthetic benchmark generator (`internal/bench`) that measures throughput, tail latencies, allocation rates, and verifies conservation of total currency across all accounts.
+
+```bash
+# Run standalone benchmark scenario
+./bin/engine bench -events 1000000 -dup 0.1 -fault 0.02 -wal group
+
+# Run full evaluation matrix
+make suite
+```
+
+### Representative Benchmark Results
+
+> Measured on Apple Silicon (14 cores, Go 1.24) with 2,000,000 unique events, 100,000 accounts, and 4 concurrent producer goroutines submitting batches of 128. Results reflect synthetic in-memory CPU and memory-bus scaling; disk durability under `ack` mode is bounded by disk fsync latency.
+
+| Scenario | Workers | Offered Events | Throughput (ev/s) | Latency p50 | Latency p99 | Duplicates | Retries | Comp | DLQ | Ledger Consistent |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Baseline | 14 | 2,000,000 | ~21.2M | 15 µs | 3.4 ms | 0 | 0 | 0 | 0 | Yes |
+| 10% Duplicates | 14 | 2,200,000 | ~21.0M | 13 µs | 82 µs | 200,000 | 0 | 0 | 0 | Yes |
+| 10% Dups, 2% Faults | 14 | 2,200,000 | ~24.3M | 20 µs | 9.4 ms | 200,000 | ~82k | ~41k | 0 | Yes |
+| 10% Dups, 20% Faults | 14 | 2,200,000 | ~2.0M | 9.4 ms | 1.0 s | 200,000 | ~1.12M | ~499k | 4,398 | Yes |
+| Skewed (50% on 10 accounts) | 14 | 2,200,000 | ~21.5M | 18 µs | 590 µs | 200,000 | ~82k | ~41k | 0 | Yes |
+| Paced (300k target/s) | 14 | 2,200,000 | 300,000 | 25 µs | 426 µs | 200,000 | ~82k | ~41k | 0 | Yes |
+
+### Durability Modes (10% Duplicates, 2% Faults)
+
+| Mode | Throughput | Latency p99 | Recovery Behavior |
+|---|---|---|---|
+| `none` (in-memory) | ~24.3M ev/s | 9.4 ms | Non-durable |
+| `buffered` | ~11.4M ev/s | 492 µs | OS page-cache dependent |
+| `group` | ~12.4M ev/s | 426 µs | Asynchronous group `f.Sync` |
+| `ack` (200k events) | ~31.7k ev/s | 14.7 ms | Synchronous fsync per batch |
+
+---
+
+## Limitations
+
+- **Single Process**: Designed for single-node vertical scaling. Distributed consensus and inter-node replication are not included.
+- **Log Compaction**: The WAL is currently append-only without checkpointing or compaction. Startup replay time scales with total log size.
+- **Fixed Deduplication Window**: The deduplication table is pre-sized to a fixed power-of-two capacity.
+- **Event ID Range**: Event IDs are uint64 with reserved sentinel values (`MaxUint64 - 2` maximum usable ID).

@@ -1,0 +1,15 @@
+# Binaries
+bin/
+
+# Test and coverage artifacts
+*.out
+*.test
+*.prof
+
+# Runtime artifacts & local logs
+*.wal
+*.log
+
+# OS metadata
+.DS_Store
+**/.DS_Store
